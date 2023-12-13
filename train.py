@@ -9,7 +9,7 @@ import argparse
 from torch.optim.lr_scheduler import StepLR
 
 from models_multiscale import CNN_Encoder
-from tr_multiscale import *
+from models_tr_multiscale import *
 from datasets import *
 from utils import *
 from eval_multiscale import evaluate_transformer
