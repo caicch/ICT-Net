@@ -34,7 +34,7 @@ class CrossTransformer(nn.Module):
         self.linear1 = nn.Linear(d_model, d_model * 4)
         self.linear2 = nn.Linear(d_model * 4, d_model)
 
-    def forward(self, input_s1, input_s2, input_l1, input_l2, w_s):
+    def forward(self, input_s1, input_s2, input_l1, input_l2):
         # dif_as_kv
         dif_s = input_s1 - input_s2
         output_s1 = self.cross(input_s1, dif_s)  # (Q,K,V)
@@ -52,10 +52,7 @@ class CrossTransformer(nn.Module):
         output_l11 = self.cross(output_l1, cat_l)  # (Q,K,V)
         output_l22 = self.cross(output_l2, cat_l)
 
-        output_rl1 = F.interpolate(output_l11.view(28,28,-1,512).permute(2, 3, 0, 1), size=(w_s, w_s), mode='bilinear', align_corners=True).view(-1, 512, w_s**2).permute(2, 0, 1)
-        output_rl2 = F.interpolate(output_l22.view(28,28,-1,512).permute(2, 3, 0, 1), size=(w_s, w_s), mode='bilinear', align_corners=True).view(-1, 512, w_s**2).permute(2, 0, 1)
-
-        return output_s11 + output_rl1, output_s22 + output_rl2#, output_l1, output_l2
+        return output_s11, output_s22, output_l11, output_l22#, output_l1, output_l2
     def cross(self, input,dif):
         # RSICCformer_D (diff_as_kv)
         attn_output, attn_weight = self.attention(input, dif, dif)  # (Q,K,V)
@@ -136,6 +133,15 @@ class MCCFormers_diff_as_Q(nn.Module):
 
         self.LN = nn.ModuleList([nn.LayerNorm(d_model*2) for i in range(n_layers)])
 
+        self.fc = nn.Linear(2048, 1024)
+
+        self.glu_layer_small = nn.Sequential(nn.Linear(d_model* 2 * n_layers, d_model*4), nn.GLU())
+
+        self.glu_layer_large = nn.Sequential(nn.Linear(d_model* 2 * n_layers, d_model * 4), nn.GLU())
+
+        self.norm1 = nn.LayerNorm(d_model*2)
+        self.norm2 = nn.LayerNorm(d_model*2)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -215,25 +221,35 @@ class MCCFormers_diff_as_Q(nn.Module):
         output_l2 = encoder_output_l2
         output_s1_list = list()
         output_s2_list = list()
+
+        output_l1_list = list()
+        output_l2_list = list()
         for l in self.transformer:
-            output1, output2 = l(output_s1, output_s2, output_l1, output_l2, w_s )
+            output_s1, output_s2, output_l1, output_l2 = l(output_s1, output_s2, output_l1, output_l2,)
 
-            output_s1_list.append(output1)
-            output_s2_list.append(output2)
+            output_rl1 = F.interpolate(output_l1.view(28, 28, -1, 512).permute(2, 3, 0, 1), size=(w_s, w_s),
+                                       mode='bilinear', align_corners=True).view(-1, 512, w_s ** 2).permute(2, 0, 1)
+            output_rl2 = F.interpolate(output_l2.view(28, 28, -1, 512).permute(2, 3, 0, 1), size=(w_s, w_s),
+                                       mode='bilinear', align_corners=True).view(-1, 512, w_s ** 2).permute(2, 0, 1)
 
-        # MBF
-        i = 0
-        output = torch.zeros((196,batch,self.d_model*2)).to(device)
-        for res in self.resblock:
-            input = torch.cat([output_s1_list[i],output_s2_list[i]],dim=-1)
-            output = output + input
-            output = output.permute(1, 2, 0).view(batch, self.d_model*2, 14, 14)
-            output = res(output)
-            output = output.view(batch, self.d_model*2,-1).permute(2, 0, 1)
-            output = self.LN[i](output)
-            i=i+1
+            output_s1_list.append(output_s1)
+            output_s2_list.append(output_s2)
 
-        return output
+            output_l1_list.append(output_rl1)
+            output_l2_list.append(output_rl2)
+
+        out_s1 = torch.cat(output_s1_list,dim=2)
+        out_s2 = torch.cat(output_s2_list, dim=2)
+        out_samll = torch.cat([out_s1, out_s2], dim=2)
+        out_samll = self.norm1(self.glu_layer_small(out_samll) + out_s1 + out_s2)
+
+        out_l1 = torch.cat(output_l1_list, dim=2)
+        out_l2 = torch.cat(output_l2_list, dim=2)
+        out_large = torch.cat([out_l1, out_l2], dim=2)
+        out_large = self.norm2(self.glu_layer_large(out_large) + out_l1 + out_l2)
+        out = torch.stack([out_samll, out_large], dim=0)
+
+        return out
 
 
 class PositionalEncoding(nn.Module):
@@ -295,6 +311,11 @@ class Mesh_TransformerDecoderLayer(nn.Module):
         self.fc_alpha2 = nn.Linear(d_model + d_model, d_model)
         self.fc_alpha3 = nn.Linear(d_model + d_model, d_model)
 
+        self.glu_layer = nn.Sequential(nn.Linear(d_model, d_model*2), nn.GLU())
+        self.fc = nn.Linear(d_model * 2, d_model)
+        self.fc2 = nn.Linear(d_model * 3, d_model)
+        self.sig = nn.Sigmoid()
+
         self.init_weights()
 
     def init_weights(self):
@@ -311,13 +332,26 @@ class Mesh_TransformerDecoderLayer(nn.Module):
 
         self_att_tgt = self.norm1(tgt + self._sa_block(tgt, tgt_mask, tgt_key_padding_mask))
         # # cross self-attention
-        enc_att, att_weight = self._mha_block2((self_att_tgt),
-                                               memory, memory_mask,
-                                               memory_key_padding_mask)
-     
-        x = self.norm2(self_att_tgt + enc_att)
-        x = self.norm3(x + self._ff_block(x))
+        enc_att_s, att_weight_s = self._mha_block2((self_att_tgt),memory[0], memory_mask,
+                                                                            memory_key_padding_mask)
 
+        enc_att_l, att_weight_l = self._mha_block2((self_att_tgt), memory[1], memory_mask,
+                                                   memory_key_padding_mask)
+
+        dec_s = torch.cat([self_att_tgt, enc_att_s], dim=2)
+        dec_sig_s = self.sig(self.fc(dec_s))
+        dec_s_out = (dec_sig_s * enc_att_s)
+
+        dec_l = torch.cat([self_att_tgt, enc_att_l], dim=2)
+        dec_sig_l = self.sig(self.fc(dec_l))
+        dec_l_out = (dec_sig_l * enc_att_l)
+
+        dec_out = torch.cat([dec_s_out, dec_l_out, self_att_tgt], dim=2)
+        x = self.fc2(dec_out)
+        x = self.norm2(x)
+        x = self.norm3(x + self._ff_block(x))
+        #x = self.norm3(x + self.glu_layer(x))
+        #x = self.glu_layer(x)
         return x
 
     # self-attention block
@@ -337,13 +371,14 @@ class Mesh_TransformerDecoderLayer(nn.Module):
                                 key_padding_mask=key_padding_mask,
                                 need_weights=True)
         return self.dropout2(x),att_weight
-    def _mha_block2(self, x: Tensor, mem: Tensor,
-                   attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tensor:
-        x ,att_weight= self.multihead_attn2(x, mem, mem,
-                                attn_mask=attn_mask,
-                                key_padding_mask=key_padding_mask,
-                                need_weights=True)
-        return self.dropout3(x),att_weight
+
+    def _mha_block2(self, x: Tensor, mem_s: Tensor,
+                    attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tensor:
+        x, att_weight = self.multihead_attn2(x, mem_s, mem_s,
+                                                 attn_mask=attn_mask,
+                                                 key_padding_mask=key_padding_mask,
+                                                 need_weights=True)
+        return self.dropout3(x), att_weight
     def _mha_block3(self, x: Tensor, mem: Tensor,
                    attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tensor:
         x ,att_weight= self.multihead_attn3(x, mem, mem,
@@ -418,7 +453,7 @@ class DecoderTransformer(nn.Module):
         tgt_embedding = self.vocab_embedding(tgt)
         tgt_embedding = self.position_encoding(tgt_embedding)  # (length, batch, feature_dim)
 
-        pred = self.transformer(tgt_embedding, memory, tgt_mask=mask)  # (length, batch, feature_dim)
+        pred = self.transformer(tgt_embedding, memory, tgt_mask=mask) # (length, batch, feature_dim)  # (length, batch, feature_dim)
         pred = self.wdc(self.dropout(pred))  # (length, batch, vocab_size)
 
         pred = pred.permute(1, 0, 2)
@@ -430,5 +465,3 @@ class DecoderTransformer(nn.Module):
         decode_lengths = (caption_lengths - 1).tolist()
 
         return pred, encoded_captions, decode_lengths, sort_ind
-
-
